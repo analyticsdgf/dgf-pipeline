@@ -57,22 +57,28 @@ SERVICE_ACCOUNT_FILE = "dgf-analytics-429368876a21.json"
 SHEETS_ID            = "19Og5wUreNhEoqLWjFrQ9bya1zEiESHhlBicRc8oYcus"   # COGS workbook
 DRIVE_FOLDER_ID      = os.environ.get("DRIVE_ANALYTICS_FOLDER_ID", "")   # Analytics Pipeline Files
 
-# Write the service-account JSON from BASE64 secret
-import base64
+# Write the service-account JSON from a BASE64 secret (GitHub Actions safe)
 import base64
 
 if not os.path.exists(SERVICE_ACCOUNT_FILE):
     sa_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "")
     if sa_b64:
         try:
-            sa_json_str = base64.b64decode(sa_b64).decode('utf-8')
+            sa_json_str = base64.b64decode(sa_b64).decode("utf-8")
             with open(SERVICE_ACCOUNT_FILE, "w") as f:
                 f.write(sa_json_str)
             print("✅ Service-account JSON written from base64 secret")
         except Exception as e:
-            print(f"❌ Could not decode base64: {e}")
+            print(f"❌ Could not decode GOOGLE_SERVICE_ACCOUNT_JSON_BASE64: {e}")
     else:
-        print("⚠️  GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 secret not set")
+        # Fallback: plain (non-base64) secret, if that's what was set
+        sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        if sa_json:
+            with open(SERVICE_ACCOUNT_FILE, "w") as f:
+                f.write(sa_json)
+            print("✅ Service-account JSON written from plain secret")
+        else:
+            print("⚠️  No service-account secret found (BASE64 or plain)")
 
 # Static input file IDs (Google Drive)
 FILE_IDS = {
@@ -185,19 +191,34 @@ def get_access_token():
 token = get_access_token()
 print("\n✅ Access token acquired")
 
+
 # ══════════════════════════════════════════════════════════════════════════
-# B2B FETCH FROM ZOHO API — INCREMENTAL   [notebook cell 2]
-# pkl + sync-state now persisted to Google Drive (folder = DRIVE_FOLDER_ID)
+# B2B FETCH FROM ZOHO API — OPTIMIZED INCREMENTAL
+# ══════════════════════════════════════════════════════════════════════════
+# Strategy:
+#   1. First run:    Full fetch (544 invoices, ~15 min)
+#   2. Later runs:   Only NEW or MODIFIED invoices since last sync (~1-2 min)
+#   
+# How it works:
+#   • Save last_sync_time to Drive (persists between GitHub runs)
+#   • Use Zoho's last_modified_time filter — API returns only changed invoices
+#   • Compare with existing pkl — only fetch truly new/updated
 # ══════════════════════════════════════════════════════════════════════════
 MASTER_FILE     = os.path.join(OUTPUT_DIR, "B2B_master.pkl")
 SYNC_STATE_FILE = os.path.join(OUTPUT_DIR, "B2B_sync_state.json")
 FULL_LOAD_START = "2026-01-01"
 
-# Pull previous state from Drive so incremental sync works across cloud runs
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 1: Pull existing state from Drive (KEY for incremental sync)
+# ══════════════════════════════════════════════════════════════════════════
 if DRIVE_FOLDER_ID:
-    print("\n📥 Restoring B2B state from Drive (if present)...")
-    drive_download_from_folder("B2B_master.pkl",     DRIVE_FOLDER_ID, MASTER_FILE)
-    drive_download_from_folder("B2B_sync_state.json", DRIVE_FOLDER_ID, SYNC_STATE_FILE)
+    print("\n📥 Restoring B2B state from Google Drive...")
+    got_pkl = drive_download_from_folder("B2B_master.pkl",     DRIVE_FOLDER_ID, MASTER_FILE)
+    got_json = drive_download_from_folder("B2B_sync_state.json", DRIVE_FOLDER_ID, SYNC_STATE_FILE)
+    if got_pkl and got_json:
+        print("   ✅ Previous state restored — incremental mode will work")
+    else:
+        print("   ℹ️  First run or state missing — will do full fetch")
 
 def get_oauth_token():
     print("🔑 Generating OAuth token...")
@@ -211,7 +232,7 @@ def get_oauth_token():
         if "access_token" in data:
             print("   ✅ Token generated successfully!")
             return data["access_token"]
-        print(f"   ❌ No access token in response: {data}")
+        print(f"   ❌ No access token: {data}")
         return None
     except Exception as e:
         print(f"   ❌ Token generation failed: {e}")
@@ -257,25 +278,24 @@ def save_sync_state(last_time, count):
     with open(SYNC_STATE_FILE, "w") as f:
         json.dump({"last_sync_time": last_time, "last_invoice_count": count,
                    "last_run": datetime.now().isoformat()}, f, indent=2)
-    print("   ✅ Sync state saved")
+    print("   ✅ Sync state saved locally")
 
 def load_master():
     if os.path.exists(MASTER_FILE):
         try:
             df = pd.read_pickle(MASTER_FILE)
-            print(f"   ✅ Loaded master: {len(df):,} rows")
+            print(f"   ✅ Loaded master from disk: {len(df):,} rows, {df['invoice_id'].nunique():,} invoices")
             return df
-        except:
-            print("   ⚠️  Could not load master file")
+        except Exception as e:
+            print(f"   ⚠️  Could not load master file: {e}")
             return None
+    print("   ℹ️  No existing master file (first run)")
     return None
 
 def get_existing_invoice_ids(master_df):
     if master_df is None or len(master_df) == 0:
         return set()
-    existing_ids = set(master_df['invoice_id'].unique())
-    print(f"   📋 Already have: {len(existing_ids):,} invoices")
-    return existing_ids
+    return set(master_df['invoice_id'].unique())
 
 def _place_with_code(place_of_supply, shipping_state):
     if place_of_supply and str(place_of_supply).strip().upper() in GST_STATE:
@@ -284,41 +304,89 @@ def _place_with_code(place_of_supply, shipping_state):
         return GST_STATE_BY_NAME[str(shipping_state).strip().lower()]
     return f"00-{shipping_state}" if shipping_state else None
 
-def get_invoice_ids(token, sync_date=None, date_start=FULL_LOAD_START):
+# ══════════════════════════════════════════════════════════════════════════
+# OPTIMIZED: Fetch invoice IDs using last_modified_time filter
+# ══════════════════════════════════════════════════════════════════════════
+def get_invoice_ids_optimized(token, sync_date=None, date_start=FULL_LOAD_START):
+    """
+    OPTIMIZED FETCH STRATEGY:
+    - If sync_date exists → use last_modified_time filter (returns ONLY changed invoices)
+    - If first run → full fetch from FULL_LOAD_START
+    """
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
     page, all_ids = 1, []
+    
     if sync_date:
         try:
-            dt = parse_date(sync_date) - timedelta(days=1)
-            fetch_from = dt.strftime('%Y-%m-%d')
-            print(f"   📅 Fetching IDs from {fetch_from} onwards...")
-        except:
+            # Use last_modified_time to fetch ONLY invoices changed after last sync
+            # Go back 1 hour to catch any race conditions
+            dt = parse_date(sync_date) - timedelta(hours=1)
+            modified_after = dt.strftime('%Y-%m-%dT%H:%M:%S%z') or dt.strftime('%Y-%m-%dT%H:%M:%S+0000')
+            print(f"   🔥 INCREMENTAL: fetching only invoices modified after {modified_after}")
+            use_modified_filter = True
+        except Exception as e:
+            print(f"   ⚠️  Could not parse sync_date: {e}, falling back to date_start")
             fetch_from = date_start
+            use_modified_filter = False
+            modified_after = None
     else:
+        print(f"   📅 FULL LOAD: fetching all invoices from {date_start}")
         fetch_from = date_start
+        use_modified_filter = False
+        modified_after = None
+    
     while True:
-        params = {"organization_id": ORG_ID, "page": page, "per_page": 200,
-                  "filter_by": "Status.All", "date_start": fetch_from}
+        params = {
+            "organization_id": ORG_ID,
+            "page": page,
+            "per_page": 200,
+            "filter_by": "Status.All",
+        }
+        
+        # Add appropriate filter
+        if use_modified_filter:
+            params["last_modified_time"] = modified_after
+        else:
+            params["date_start"] = fetch_from
+        
         try:
             r = requests.get("https://www.zohoapis.in/books/v3/invoices",
                              headers=headers, params=params, timeout=15)
+            
             if r.status_code == 401:
-                print("   ❌ 401 Error: Authentication failed. Token may be expired."); break
+                print("   ❌ 401 Error: Auth failed"); break
             if r.status_code == 400:
-                print(f"   ❌ 400 error on page {page}"); break
+                # If last_modified_time not supported, fallback to date_start
+                if use_modified_filter:
+                    print(f"   ⚠️  last_modified_time not accepted, falling back to date_start")
+                    use_modified_filter = False
+                    fetch_from = date_start
+                    all_ids = []
+                    page = 1
+                    continue
+                else:
+                    print(f"   ❌ 400 error on page {page}: {r.text[:200]}"); break
+            
             r.raise_for_status()
             data = r.json()
+            
             if data.get("code") != 0:
                 print(f"   ❌ Zoho error: {data.get('message')}"); break
+            
             invoices = data.get("invoices", [])
-            if not invoices: break
+            if not invoices:
+                break
+            
             all_ids.extend(x["invoice_id"] for x in invoices)
             if page % 5 == 0 or len(invoices) < 200:
                 print(f"      📦 Page {page}: {len(invoices)} IDs (total: {len(all_ids)})")
+            
             page += 1
             time.sleep(0.3)
         except Exception as e:
-            print(f"   ⚠️  Page {page} error: {e}"); break
+            print(f"   ⚠️  Page {page} error: {e}")
+            break
+    
     return all_ids
 
 def get_invoice_detail(invoice_id, token, retries=3):
@@ -394,6 +462,9 @@ def to_invoice_format(raw):
     out['Invoice Type']  = 'Invoice'
     return out[INVOICE_COLUMNS]
 
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN B2B PIPELINE — OPTIMIZED FLOW
+# ══════════════════════════════════════════════════════════════════════════
 print("\n" + "="*70)
 print("🚀 B2B ZOHO FETCH - OPTIMIZED INCREMENTAL")
 print("="*70)
@@ -403,38 +474,69 @@ token = get_oauth_token()
 if not token:
     print("\n❌ FATAL: Could not generate OAuth token!"); sys.exit(1)
 
-print("\n[1] Loading existing data...")
+print("\n[1] Loading existing data from disk...")
 master = load_master()
 existing_ids = get_existing_invoice_ids(master)
 sync_state = load_sync_state()
+last_sync = sync_state.get("last_sync_time")
 
-print("\n[2] Fetching ALL invoice IDs from Zoho...")
-all_ids = get_invoice_ids(token, sync_date=sync_state.get("last_sync_time"))
-print(f"   📊 Total in Zoho: {len(all_ids):,}")
+# Decide strategy
+if master is not None and last_sync and len(existing_ids) > 100:
+    print(f"\n[2] Fetching ONLY invoices modified since {last_sync[:10]}")
+    print(f"    (Skipping {len(existing_ids):,} already-fetched invoices)")
+    changed_ids = get_invoice_ids_optimized(token, sync_date=last_sync)
+else:
+    print(f"\n[2] Full fetch (first run or state missing)...")
+    changed_ids = get_invoice_ids_optimized(token, sync_date=None)
 
-new_ids = [i for i in all_ids if i not in existing_ids]
-print(f"\n[3] Smart filtering:")
-print(f"   ✅ Already have: {len(existing_ids):,} invoices")
-print(f"   🆕 New to fetch: {len(new_ids):,} invoices")
+print(f"   📊 Invoices returned by API: {len(changed_ids):,}")
 
-if len(new_ids) == 0:
-    print("\n   ℹ️  No new invoices. Using existing master.")
+# Filter: only fetch truly new/updated
+if master is not None and len(existing_ids) > 0:
+    # For incremental mode, we fetch ALL changed IDs (even if they exist,
+    # because they may have been updated)
+    truly_new = [i for i in changed_ids if i not in existing_ids]
+    updated = [i for i in changed_ids if i in existing_ids]
+    print(f"\n[3] Filtering:")
+    print(f"   🆕 Truly new invoices:     {len(truly_new):,}")
+    print(f"   🔄 Updated existing:       {len(updated):,}")
+    print(f"   ✅ Skipping unchanged:     {len(existing_ids) - len(updated):,}")
+    to_fetch = changed_ids  # fetch all changed (new + updated)
+else:
+    truly_new = changed_ids
+    to_fetch = changed_ids
+    print(f"\n[3] First run — fetching all {len(to_fetch):,} invoices")
+
+if len(to_fetch) == 0:
+    print("\n   ℹ️  No changes since last sync!")
     raw = master if master is not None else pd.DataFrame(columns=RAW_COLUMNS)
     B2B = to_invoice_format(raw)
 else:
-    print(f"\n[4] Fetching {len(new_ids):,} new invoices...")
+    print(f"\n[4] Fetching {len(to_fetch):,} invoice details from Zoho...")
     new_rows = []
-    for i, inv_id in enumerate(new_ids, 1):
-        if i % 50 == 0 or i == len(new_ids):
-            print(f"      ⏳ {i}/{len(new_ids)} ({i/len(new_ids)*100:.0f}%)")
+    for i, inv_id in enumerate(to_fetch, 1):
+        if i % 25 == 0 or i == len(to_fetch):
+            print(f"      ⏳ {i}/{len(to_fetch)} ({i/len(to_fetch)*100:.0f}%)")
         inv = get_invoice_detail(inv_id, token)
         if inv:
             new_rows.extend(flatten_invoice_to_rows(inv))
+    
     new_raw = pd.DataFrame(new_rows, columns=RAW_COLUMNS) if new_rows else pd.DataFrame(columns=RAW_COLUMNS)
-    print(f"   ✅ Fetched: {len(new_raw):,} new line items")
+    print(f"   ✅ Fetched: {len(new_raw):,} line items from {len(to_fetch):,} invoices")
 
     print("\n[5] Merging with existing master...")
-    raw = pd.concat([master, new_raw], ignore_index=True) if master is not None else new_raw
+    if master is not None and len(master) > 0:
+        # Remove updated invoices from old master (they're being replaced)
+        if len(new_raw) > 0:
+            updated_ids = set(new_raw['invoice_id'].unique())
+            master_kept = master[~master['invoice_id'].isin(updated_ids)]
+            raw = pd.concat([master_kept, new_raw], ignore_index=True)
+            print(f"   Merged: {len(master_kept):,} kept + {len(new_raw):,} new/updated = {len(raw):,} total")
+        else:
+            raw = master
+    else:
+        raw = new_raw
+    
     raw['invoice_date'] = pd.to_datetime(raw['invoice_date'], errors='coerce')
     raw['due_date']     = pd.to_datetime(raw['due_date'], errors='coerce')
     raw = (raw.sort_values('invoice_date', ascending=False)
@@ -448,22 +550,23 @@ else:
     print(f"   ✅ Master saved: {len(raw):,} line items ({raw['invoice_id'].nunique():,} invoices)")
     save_sync_state(datetime.now().isoformat(), raw['invoice_id'].nunique())
 
-    # Persist B2B state back to Drive
+    # PERSIST TO DRIVE (critical for next run!)
     if DRIVE_FOLDER_ID:
+        print("\n[6] Uploading updated state to Drive...")
         drive_upload_to_folder(MASTER_FILE, "B2B_master.pkl", DRIVE_FOLDER_ID)
         drive_upload_to_folder(SYNC_STATE_FILE, "B2B_sync_state.json", DRIVE_FOLDER_ID)
 
     B2B = to_invoice_format(raw)
 
-print(f"\n[6] ✅ B2B READY: {B2B.shape[0]:,} rows × {B2B.shape[1]} columns")
+print(f"\n[7] ✅ B2B READY: {B2B.shape[0]:,} rows × {B2B.shape[1]} columns")
 print(f"    💰 Revenue: ₹{pd.to_numeric(B2B['Item Total'], errors='coerce').sum():,.0f}")
 
-# Sanity check  [notebook cell 3]
 _need = ['Invoice Date','Invoice Number','Customer Name','Place of Supply(With State Code)',
          'PurchaseOrder','Item Name','Quantity','Item Total','Usage unit','Item Price',
          'Shipping Attention','Shipping State','Invoice Status']
 _missing = [c for c in _need if c not in B2B.columns]
 print("✅ All required B2B columns present" if not _missing else f"❌ MISSING: {_missing}")
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # DATABASE CONNECTION   [notebook cell 4]
@@ -3037,4 +3140,74 @@ print("     • B2B_sync_state.json     (updated)")
 print("   Google Sheets:")
 print("     • COGS workbook           → COGS_Daily_Full / _Summary / _B2B_Only")
 print("     • Analytics Tracker | DGF → Master_orders")
+print("="*70)
+
+# ══════════════════════════════════════════════════════════════════════════
+# SAKSHAM SHEET PUSH — 1P orders, June 2026 onwards (incremental append)
+# [notebook cell 50]  Uses df_push from the Master_orders push above.
+# ══════════════════════════════════════════════════════════════════════════
+print("\n" + "="*70)
+print("📤 SAKSHAM SHEET UPDATE")
+print("="*70)
+try:
+    import gspread
+    _SAKSHAM_SCOPES = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    _creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=_SAKSHAM_SCOPES)
+    _client = gspread.authorize(_creds)
+
+    SPREADSHEET_ID = "1BgXBWFB7A1-HTHunMUA3Lss4L293M-6cnTxpHkG8rQA"
+    SHEET_NAME = "main"
+    sheet = _client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+
+    # Date conversion
+    df_push["Created at"] = pd.to_datetime(df_push["Created at"], errors="coerce")
+
+    # Filter: 1P channel + June 2026 onwards
+    filtered_orders = df_push[
+        (df_push["channel"] == "1P") &
+        (df_push["Created at"] >= "2026-06-01")
+    ].copy()
+
+    # Required columns
+    df_to_upload = filtered_orders[[
+        "Created at", "Name", "segment_lifetime",
+        "order_status", "sub_channel", "total_lifetime_orders",
+    ]].copy()
+
+    # Format date
+    df_to_upload["Created at"] = df_to_upload["Created at"].dt.strftime("%d-%b-%y")
+
+    # Existing sheet data → dedup by Order ID (column B)
+    existing_data = sheet.get_all_values()
+    if len(existing_data) > 1:
+        existing_order_ids = set(
+            row[1].strip() for row in existing_data[1:] if len(row) > 1 and row[1]
+        )
+    else:
+        existing_order_ids = set()
+
+    # Remove duplicates
+    new_orders = df_to_upload[
+        ~df_to_upload["Name"].astype(str).isin(existing_order_ids)
+    ].copy()
+    new_orders = new_orders.sort_values("Created at")
+
+    if not new_orders.empty:
+        rows_to_append = new_orders.astype(str).values.tolist()
+        col_a = sheet.col_values(1)
+        start_row = 2 if len(col_a) <= 1 else len(col_a) + 1
+        end_row = start_row + len(rows_to_append) - 1
+        range_to_update = f"A{start_row}:F{end_row}"
+        sheet.update(range_to_update, rows_to_append, value_input_option="USER_ENTERED")
+        print(f"   ✅ {len(rows_to_append)} new rows pushed from row {start_row}")
+    else:
+        print("   ℹ️  No new 1P orders to push.")
+except Exception as e:
+    print(f"   ⚠️  Saksham sheet push failed: {e}")
+
+print("\n" + "="*70)
+print("✅✅✅ ALL DONE — PIPELINE FULLY COMPLETE ✅✅✅")
 print("="*70)
