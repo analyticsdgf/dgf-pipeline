@@ -59,6 +59,8 @@ DRIVE_FOLDER_ID      = os.environ.get("DRIVE_ANALYTICS_FOLDER_ID", "")   # Analy
 
 # Write the service-account JSON from BASE64 secret
 import base64
+import base64
+
 if not os.path.exists(SERVICE_ACCOUNT_FILE):
     sa_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "")
     if sa_b64:
