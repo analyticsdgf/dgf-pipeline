@@ -1,27 +1,21 @@
 name: DGF Pipeline Scheduler
-
 on:
   schedule:
     - cron: '30 2,4,7,10,13 * * *'
   workflow_dispatch:
-
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-
       - name: Run Pipeline
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
@@ -40,5 +34,8 @@ jobs:
           DRIVE_ZIP_SHOPIFY: ${{ secrets.DRIVE_ZIP_SHOPIFY }}
           DRIVE_INDIAN_ZIP: ${{ secrets.DRIVE_INDIAN_ZIP }}
           DRIVE_CUSTOMER_EMAIL: ${{ secrets.DRIVE_CUSTOMER_EMAIL }}
+          DRIVE_ANALYTICS_FOLDER_ID: ${{ secrets.DRIVE_ANALYTICS_FOLDER_ID }}
+          DRIVE_B2B_FOLDER_ID: ${{ secrets.DRIVE_B2B_FOLDER_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON_BASE64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 }}
         run: |
           python "DGF_Pipeline_v9 (2).py"
