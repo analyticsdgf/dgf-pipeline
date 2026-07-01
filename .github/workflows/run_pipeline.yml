@@ -1,0 +1,44 @@
+name: DGF Pipeline Scheduler
+
+on:
+  schedule:
+    - cron: '30 2,4,7,10,13 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Pipeline
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+          ORG_ID: ${{ secrets.ORG_ID }}
+          DRIVE_ORDERS_1: ${{ secrets.DRIVE_ORDERS_1 }}
+          DRIVE_ORDERS_2: ${{ secrets.DRIVE_ORDERS_2 }}
+          DRIVE_ORDERS_3: ${{ secrets.DRIVE_ORDERS_3 }}
+          DRIVE_CUSTOMERS: ${{ secrets.DRIVE_CUSTOMERS }}
+          DRIVE_ZIP_SHOPIFY: ${{ secrets.DRIVE_ZIP_SHOPIFY }}
+          DRIVE_INDIAN_ZIP: ${{ secrets.DRIVE_INDIAN_ZIP }}
+          DRIVE_CUSTOMER_EMAIL: ${{ secrets.DRIVE_CUSTOMER_EMAIL }}
+        run: |
+          python "DGF_Pipeline_v9 (2).py"
