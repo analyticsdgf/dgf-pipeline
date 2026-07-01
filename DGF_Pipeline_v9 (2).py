@@ -57,15 +57,20 @@ SERVICE_ACCOUNT_FILE = "dgf-analytics-429368876a21.json"
 SHEETS_ID            = "19Og5wUreNhEoqLWjFrQ9bya1zEiESHhlBicRc8oYcus"   # COGS workbook
 DRIVE_FOLDER_ID      = os.environ.get("DRIVE_ANALYTICS_FOLDER_ID", "")   # Analytics Pipeline Files
 
-# Write the service-account JSON from a secret if the file isn't already present
+# Write the service-account JSON from BASE64 secret
+import base64
 if not os.path.exists(SERVICE_ACCOUNT_FILE):
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    if sa_json:
-        with open(SERVICE_ACCOUNT_FILE, "w") as f:
-            f.write(sa_json)
-        print("✅ Service-account JSON written from secret")
+    sa_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "")
+    if sa_b64:
+        try:
+            sa_json_str = base64.b64decode(sa_b64).decode('utf-8')
+            with open(SERVICE_ACCOUNT_FILE, "w") as f:
+                f.write(sa_json_str)
+            print("✅ Service-account JSON written from base64 secret")
+        except Exception as e:
+            print(f"❌ Could not decode base64: {e}")
     else:
-        print("⚠️  Service-account JSON not found (file missing and no secret set)")
+        print("⚠️  GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 secret not set")
 
 # Static input file IDs (Google Drive)
 FILE_IDS = {
