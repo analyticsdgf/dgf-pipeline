@@ -176,9 +176,12 @@ MANUAL_COLS = [
 ]
 
 # NOTE: The original notebook's SQL cell was truncated in the .ipynb file
-# (the hsn join + fetch function were missing). Reconstructed here with a
-# FALLBACK: if the hsn join fails (table/column name differs), we retry
-# without hsn columns so the catalogue still builds.
+# (the hsn join + fetch function were missing). Instead of guessing the hsn
+# table/column names, we now ASK the database itself via information_schema
+# (PostgreSQL's built-in dictionary of every table & column). Discovery:
+#   Case A: products table has hsn/gst columns directly  → select them
+#   Case B: a separate %hsn% table exists                → build the join
+#   Case C: nothing found                                → blank hsn/gst
 _SQL_BODY = """
 SELECT
     p.product_id, p.sku, p.title, p.slug, p.status,
@@ -202,27 +205,74 @@ FROM products p
 LEFT JOIN unit u ON u.unit_id = p.unit_id
 {HSN_JOIN}
 """
-SQL_WITH_HSN = _SQL_BODY.format(
-    HSN_COLS="h.hsn_code, h.gst_percentage AS gst_pct,",
-    HSN_JOIN="LEFT JOIN hsn h ON h.hsn_id = p.hsn_id",
+
+_CAT_CONN_STR = (
+    f"postgresql+psycopg2://{DB_USER}:{quote_plus(DB_PASSWORD)}"
+    f"@{DB_HOST}:{DB_PORT}/{DB_NAME}?sslmode=require"
 )
-SQL_NO_HSN = _SQL_BODY.format(HSN_COLS="", HSN_JOIN="")
+
+
+def _cols_of(engine, table):
+    q = text("SELECT column_name FROM information_schema.columns WHERE table_name = :t")
+    return pd.read_sql(q, engine, params={"t": table})["column_name"].tolist()
+
+
+def _discover_hsn(engine):
+    """Return (HSN_COLS, HSN_JOIN) by inspecting the live schema."""
+    try:
+        prod_cols = _cols_of(engine, "products")
+
+        # Case A: hsn/gst columns live directly on products
+        hsn_direct = next((c for c in prod_cols
+                           if "hsn" in c.lower() and not c.lower().endswith("id")), None)
+        gst_direct = next((c for c in prod_cols if "gst" in c.lower()), None)
+        if hsn_direct:
+            cols = f"p.{hsn_direct} AS hsn_code, "
+            cols += f"p.{gst_direct} AS gst_pct," if gst_direct else "NULL AS gst_pct,"
+            print(f"   🔎 hsn discovery: found directly on products ({hsn_direct}, {gst_direct})")
+            return cols, ""
+
+        # Case B: separate hsn-like table
+        tq = text("""SELECT table_name FROM information_schema.tables
+                     WHERE table_schema='public' AND table_name ILIKE :pat""")
+        hsn_tables = pd.read_sql(tq, engine, params={"pat": "%hsn%"})["table_name"].tolist()
+        p_key = next((c for c in prod_cols if "hsn" in c.lower() and "id" in c.lower()), None)
+        for t in hsn_tables:
+            tcols = _cols_of(engine, t)
+            t_key = (next((c for c in tcols if "hsn" in c.lower() and "id" in c.lower()), None)
+                     or ("id" if "id" in tcols else None))
+            if not (p_key and t_key):
+                continue
+            hsn_c = next((c for c in tcols if "code" in c.lower()), None)
+            gst_c = next((c for c in tcols if "gst" in c.lower() or "percent" in c.lower()), None)
+            cols = (f"h.{hsn_c} AS hsn_code, " if hsn_c else "NULL AS hsn_code, ")
+            cols += (f"h.{gst_c} AS gst_pct," if gst_c else "NULL AS gst_pct,")
+            join = f"LEFT JOIN {t} h ON h.{t_key} = p.{p_key}"
+            print(f"   🔎 hsn discovery: table '{t}' via {t_key}={p_key} (code={hsn_c}, gst={gst_c})")
+            return cols, join
+
+        print("   🔎 hsn discovery: nothing found — hsn_code/gst_pct will be blank")
+        return "", ""
+    except Exception as e:
+        print(f"   ⚠️  hsn discovery failed ({str(e)[:80]}) — proceeding without hsn")
+        return "", ""
 
 
 def fetch_from_db():
-    conn = psycopg2.connect(**DB)
+    eng = create_engine(_CAT_CONN_STR)
     try:
+        hsn_cols, hsn_join = _discover_hsn(eng)
+        sql = _SQL_BODY.format(HSN_COLS=hsn_cols, HSN_JOIN=hsn_join)
         try:
-            df = pd.read_sql(SQL_WITH_HSN, conn)
+            df = pd.read_sql(text(sql), eng)
         except Exception as e:
-            print(f"   ⚠️  hsn join failed ({str(e)[:80]}) — retrying without hsn")
-            conn.rollback()
-            df = pd.read_sql(SQL_NO_HSN, conn)
-            df["hsn_code"] = None
-            df["gst_pct"] = None
+            print(f"   ⚠️  discovered-hsn query failed ({str(e)[:80]}) — retrying without hsn")
+            df = pd.read_sql(text(_SQL_BODY.format(HSN_COLS="", HSN_JOIN="")), eng)
+        if "hsn_code" not in df.columns: df["hsn_code"] = None
+        if "gst_pct"  not in df.columns: df["gst_pct"]  = None
     finally:
-        conn.close()
-    # Decimal → float (psycopg2 returns NUMERIC as Decimal objects)
+        eng.dispose()
+    # Decimal → float (PostgreSQL NUMERIC arrives as Decimal objects)
     for c in ["mrp", "sp", "quantity", "gst_pct"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -516,8 +566,8 @@ try:
     print("→ Cleaning & deduplicating...")
     _cat_df = clean_and_deduplicate(_cat_df)
     print(f"Final: {len(_cat_df)} unique SKUs")
-    print("  Habitat:", dict(_cat_df["habitat_auto"].value_counts()))
-    print("  Status: ", dict(_cat_df["source_status"].value_counts()))
+    print("  Habitat:", {k: int(v) for k, v in _cat_df["habitat_auto"].value_counts().items()})
+    print("  Status: ", {k: int(v) for k, v in _cat_df["source_status"].value_counts().items()})
     print(f"→ Pushing to Google Sheet ({TAB_NAME})...")
     upsert(_cat_df)
     print("✓ STAGE 1 DONE.")
@@ -589,11 +639,19 @@ try:
     print("\n📥 Downloading master_orders.parquet from Google Drive...")
     if not DRIVE_FOLDER_ID:
         raise RuntimeError("DRIVE_ANALYTICS_FOLDER_ID not set — cannot fetch master_orders.parquet")
-    got = drive_download_from_folder("master_orders.parquet", DRIVE_FOLDER_ID, MASTER_PARQUET)
-    if not got or os.path.getsize(MASTER_PARQUET) < 1024:
+    _fid = drive_find_in_folder("master_orders.parquet", DRIVE_FOLDER_ID)
+    if not _fid:
         raise RuntimeError(
-            "master_orders.parquet missing/empty on Drive. "
-            "Run the main DGF Pipeline first (it uploads this file)."
+            "master_orders.parquet is NOT INSIDE the 'Analytics Pipeline Files' folder. "
+            "Uploading to Drive Home puts it in My Drive root — that is not enough. "
+            "In Drive: right-click the file → Organise → Move → into the folder. Then re-run."
+        )
+    drive_download_by_id(_fid, MASTER_PARQUET)
+    if os.path.getsize(MASTER_PARQUET) < 1024:
+        raise RuntimeError(
+            "master_orders.parquet in the folder is still an EMPTY placeholder. "
+            "Run the main 'DGF Pipeline Scheduler' once — it fills this file with real "
+            "data (~5 MB) — then this pipeline will work (it also auto-runs after it)."
         )
 
     mo = pd.read_parquet(MASTER_PARQUET)
