@@ -1704,6 +1704,9 @@ master_orders.loc[mask_1p_shopify, 'Lineitem_Discount'] = np.where(
     master_orders.loc[mask_1p_shopify, '_order_discount'],
     0
 )
+# ── Ensure numeric dtype for revenue calculations (pandas 2.0+ fix)
+master_orders['Lineitem_Revenue'] = pd.to_numeric(master_orders['Lineitem_Revenue'], errors='coerce')
+master_orders['Gross_Revenue'] = pd.to_numeric(master_orders['Gross_Revenue'], errors='coerce')
 
 master_orders.loc[mask_1p_shopify, 'Gross_Revenue'] = (
     master_orders.loc[mask_1p_shopify, 'Lineitem_Revenue'] -
