@@ -149,15 +149,28 @@ def drive_upload_to_folder(local_path, filename, folder_id):
         existing = drive_find_in_folder(filename, folder_id)
         media = MediaFileUpload(local_path, resumable=True)
         if existing:
+            # UPDATE keeps the file owned by YOU (uses your quota) — always works
             service.files().update(fileId=existing, media_body=media).execute()
             print(f"   ✅ Updated on Drive: {filename}")
-        else:
+            return True
+        # CREATE makes the service account the owner — personal My Drive
+        # gives service accounts ZERO storage quota, so this can 403.
+        try:
             service.files().create(
                 body={"name": filename, "parents": [folder_id]},
                 media_body=media,
             ).execute()
             print(f"   ✅ Uploaded to Drive: {filename}")
-        return True
+            return True
+        except Exception as ce:
+            if "storageQuota" in str(ce) or "quota" in str(ce).lower():
+                print(f"   ⚠️  Cannot CREATE {filename} (service accounts have no storage quota).")
+                print(f"       ONE-TIME FIX: manually upload any small placeholder file named")
+                print(f"       exactly '{filename}' into the Drive folder from YOUR account.")
+                print(f"       After that, this pipeline will UPDATE it successfully every run.")
+            else:
+                print(f"   ⚠️  Upload failed for {filename}: {ce}")
+            return False
     except Exception as e:
         print(f"   ⚠️  Upload failed for {filename}: {e}")
         return False
@@ -1662,6 +1675,26 @@ print(f"   Shopify (1P):       {mask_1p_shopify.sum():,} rows  — proportional 
 print(f"   Admin (1P):         {mask_1p_admin.sum():,} rows  — direct source Net sales")
 print(f"   B2B/B2C (Zoho):     {mask_b2b_zoho.sum():,} rows  — line-level Lineitem price")
 
+# ══════════════════════════════════════════════════════════════════════════
+# ⚠️ CRITICAL DTYPE FIX (pandas 2.x/3.x compatibility)
+# WHY: After concat, money columns are MIXED-TYPE ('object' dtype):
+#   • Admin rows carry decimal.Decimal objects (PostgreSQL NUMERIC → psycopg2)
+#   • B2B rows carry pd.NA (Subtotal/Total set only on first invoice line)
+# Newer pandas REFUSES to assign object-typed values into float64 columns
+# (raises "TypeError: Invalid value ... for dtype 'float64'").
+# FIX: Force every money/qty column to real float64 BEFORE any assignment.
+# ══════════════════════════════════════════════════════════════════════════
+_money_cols = [
+    'Subtotal', 'Total', 'Taxes', 'Shipping', 'Discount Amount',
+    'Lineitem quantity', 'Lineitem price', 'Lineitem discount',
+    'Lineitem unit price', 'Refunded Amount', 'Outstanding Balance',
+    'Total with Shipping', 'CGST', 'SGST', 'IGST',
+]
+for _c in _money_cols:
+    if _c in master_orders.columns:
+        master_orders[_c] = pd.to_numeric(master_orders[_c], errors='coerce').astype('float64')
+print(f"   ✅ Money columns coerced to float64 (pandas 3.x safe)")
+
 # ── 10.1: SHOPIFY only — recover missing Lineitem price from Subtotal/qty
 needs_recovery = (
     mask_1p_shopify &
@@ -1686,7 +1719,7 @@ master_orders['Gross_Revenue']     = 0.0   # v7 NEW: was 'Net_Revenue'
 master_orders.loc[mask_1p_shopify, 'Lineitem_Revenue'] = (
     master_orders.loc[mask_1p_shopify, 'Lineitem quantity'].fillna(0) *
     master_orders.loc[mask_1p_shopify, 'Lineitem price'].fillna(0)
-)
+).to_numpy(dtype='float64')
 
 order_discount_shopify = (
     master_orders[mask_1p_shopify].groupby('Name')['Discount Amount']
@@ -1704,38 +1737,35 @@ master_orders.loc[mask_1p_shopify, 'Lineitem_Discount'] = np.where(
     master_orders.loc[mask_1p_shopify, '_order_discount'],
     0
 )
-# ── Ensure numeric dtype for revenue calculations (pandas 2.0+ fix)
-master_orders['Lineitem_Revenue'] = pd.to_numeric(master_orders['Lineitem_Revenue'], errors='coerce')
-master_orders['Gross_Revenue'] = pd.to_numeric(master_orders['Gross_Revenue'], errors='coerce')
 
 master_orders.loc[mask_1p_shopify, 'Gross_Revenue'] = (
     master_orders.loc[mask_1p_shopify, 'Lineitem_Revenue'] -
     master_orders.loc[mask_1p_shopify, 'Lineitem_Discount']
-).clip(lower=0)
+).clip(lower=0).to_numpy(dtype='float64')
 
 # ── 10.4: ADMIN (1P) — use source's "Net sales" (already in 'Total')
 master_orders.loc[mask_1p_admin, 'Lineitem_Revenue']  = (
-    master_orders.loc[mask_1p_admin, 'Subtotal'].fillna(0)
+    master_orders.loc[mask_1p_admin, 'Subtotal'].fillna(0).to_numpy(dtype='float64')
 )
 master_orders.loc[mask_1p_admin, 'Lineitem_Discount'] = (
-    master_orders.loc[mask_1p_admin, 'Discount Amount'].fillna(0)
+    master_orders.loc[mask_1p_admin, 'Discount Amount'].fillna(0).to_numpy(dtype='float64')
 )
 master_orders.loc[mask_1p_admin, 'Gross_Revenue'] = (
-    master_orders.loc[mask_1p_admin, 'Total'].fillna(0)
-).clip(lower=0)
+    master_orders.loc[mask_1p_admin, 'Total'].fillna(0).clip(lower=0).to_numpy(dtype='float64')
+)
 
 # ── 10.5: B2B/B2C ZOHO (Hyperpure, Institutional, Blinkit) — line-level
-master_orders.loc[mask_b2b_zoho, 'Lineitem_Revenue']  = master_orders.loc[mask_b2b_zoho, 'Lineitem price'].fillna(0)
-master_orders.loc[mask_b2b_zoho, 'Lineitem_Discount'] = 0
-master_orders.loc[mask_b2b_zoho, 'Gross_Revenue']     = master_orders.loc[mask_b2b_zoho, 'Lineitem price'].fillna(0)
+master_orders.loc[mask_b2b_zoho, 'Lineitem_Revenue']  = master_orders.loc[mask_b2b_zoho, 'Lineitem price'].fillna(0).to_numpy(dtype='float64')
+master_orders.loc[mask_b2b_zoho, 'Lineitem_Discount'] = 0.0
+master_orders.loc[mask_b2b_zoho, 'Gross_Revenue']     = master_orders.loc[mask_b2b_zoho, 'Lineitem price'].fillna(0).to_numpy(dtype='float64')
 
 # ── 10.6: Reconcile order-level Total (Shopify only)
 order_total_shopify = (
     master_orders[mask_1p_shopify].groupby('Name')['Gross_Revenue'].sum().round(2)
 )
-master_orders.loc[mask_1p_shopify, 'Total'] = (
-    master_orders.loc[mask_1p_shopify, 'Name'].map(order_total_shopify)
-)
+master_orders.loc[mask_1p_shopify, 'Total'] = pd.to_numeric(
+    master_orders.loc[mask_1p_shopify, 'Name'].map(order_total_shopify), errors='coerce'
+).to_numpy(dtype='float64')
 
 # ── 10.7: Discount ratio
 master_orders['Discount_Ratio'] = np.where(
