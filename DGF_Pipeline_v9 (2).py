@@ -310,6 +310,21 @@ def get_existing_invoice_ids(master_df):
         return set()
     return set(master_df['invoice_id'].unique())
 
+def _load_state():
+    """Load last sync timestamp."""
+    if os.path.exists(SYNC_STATE_FILE):
+        try:
+            with open(SYNC_STATE_FILE) as f:
+                return json.load(f).get("last_sync_time")
+        except Exception:
+            return None
+    return None
+
+def _save_state():
+    """Save current timestamp as last sync."""
+    with open(SYNC_STATE_FILE, "w") as f:
+        json.dump({"last_sync_time": datetime.now().isoformat()}, f)
+
 def _place_with_code(place_of_supply, shipping_state):
     if place_of_supply and str(place_of_supply).strip().upper() in GST_STATE:
         return GST_STATE[str(place_of_supply).strip().upper()]
@@ -318,89 +333,88 @@ def _place_with_code(place_of_supply, shipping_state):
     return f"00-{shipping_state}" if shipping_state else None
 
 # ══════════════════════════════════════════════════════════════════════════
-# OPTIMIZED: Fetch invoice IDs using last_modified_time filter
+# FETCH INVOICE IDs with PROPER ISO TIMESTAMP + FALLBACK
 # ══════════════════════════════════════════════════════════════════════════
-def get_invoice_ids_optimized(token, sync_date=None, date_start=FULL_LOAD_START):
+def get_invoice_ids(token, sync_date=None, date_start=FULL_LOAD_START):
     """
-    OPTIMIZED FETCH STRATEGY:
-    - If sync_date exists → use last_modified_time filter (returns ONLY changed invoices)
-    - If first run → full fetch from FULL_LOAD_START
+    Fetch invoice IDs from Zoho.
+    - Full load   : filter by INVOICE DATE (date_start = 'YYYY-MM-DD')
+    - Incremental : filter by LAST MODIFIED. Zoho needs a FULL ISO timestamp
+                    with timezone e.g. '2026-07-15T00:00:00+0530'.
+                    Plain date deta hai to 400 'Invalid value' aata hai.
+    Incremental fail ho to chup-chaap FULL load pe fallback ho jaata hai.
     """
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
-    page, all_ids = 1, []
-    
-    if sync_date:
+
+    incremental = bool(sync_date)
+    lmt_value = None
+    if incremental:
         try:
-            # Use last_modified_time to fetch ONLY invoices changed after last sync
-            # Go back 1 hour to catch any race conditions
-            dt = parse_date(sync_date) - timedelta(hours=1)
-            modified_after = dt.strftime('%Y-%m-%dT%H:%M:%S%z') or dt.strftime('%Y-%m-%dT%H:%M:%S+0000')
-            print(f"   🔥 INCREMENTAL: fetching only invoices modified after {modified_after}")
-            use_modified_filter = True
-        except Exception as e:
-            print(f"   ⚠️  Could not parse sync_date: {e}, falling back to date_start")
-            fetch_from = date_start
-            use_modified_filter = False
-            modified_after = None
-    else:
-        print(f"   📅 FULL LOAD: fetching all invoices from {date_start}")
-        fetch_from = date_start
-        use_modified_filter = False
-        modified_after = None
-    
-    while True:
-        params = {
-            "organization_id": ORG_ID,
-            "page": page,
-            "per_page": 200,
-            "filter_by": "Status.All",
-        }
-        
-        # Add appropriate filter
-        if use_modified_filter:
-            params["last_modified_time"] = modified_after
-        else:
-            params["date_start"] = fetch_from
-        
-        try:
-            r = requests.get("https://www.zohoapis.in/books/v3/invoices",
-                             headers=headers, params=params, timeout=15)
-            
-            if r.status_code == 401:
-                print("   ❌ 401 Error: Auth failed"); break
-            if r.status_code == 400:
-                # If last_modified_time not supported, fallback to date_start
-                if use_modified_filter:
-                    print(f"   ⚠️  last_modified_time not accepted, falling back to date_start")
-                    use_modified_filter = False
-                    fetch_from = date_start
-                    all_ids = []
-                    page = 1
-                    continue
-                else:
-                    print(f"   ❌ 400 error on page {page}: {r.text[:200]}"); break
-            
-            r.raise_for_status()
-            data = r.json()
-            
-            if data.get("code") != 0:
-                print(f"   ❌ Zoho error: {data.get('message')}"); break
-            
-            invoices = data.get("invoices", [])
-            if not invoices:
+            dt = parse_date(sync_date) - timedelta(days=1)   # 1 day buffer for edge cases
+            lmt_value = dt.strftime('%Y-%m-%dT00:00:00+0530') # IST offset, no colon
+            print(f"   📅 Incremental: invoices MODIFIED since {lmt_value}")
+        except Exception:
+            print(f"   ⚠️  Could not parse sync_date {sync_date} → full load")
+            incremental = False
+
+    if not incremental:
+        print(f"   📅 Full load: invoices DATED from {date_start} onwards")
+
+    def _pull(use_incremental):
+        page, ids = 1, []
+        while True:
+            params = {
+                "organization_id": ORG_ID,
+                "page": page,
+                "per_page": 200,
+                "filter_by": "Status.All",
+            }
+            if use_incremental:
+                params["last_modified_time"] = lmt_value
+                params["sort_column"]        = "last_modified_time"
+            else:
+                params["date_start"]         = date_start
+
+            try:
+                r = requests.get("https://www.zohoapis.in/books/v3/invoices",
+                                 headers=headers, params=params, timeout=15)
+                print(f"   [page {page}] {r.url[:95]}...")
+
+                if r.status_code == 400:
+                    print(f"   ❌ 400 on page {page}: {r.text[:160]}")
+                    return None                      # signal failure → caller falls back
+
+                r.raise_for_status()
+                data = r.json()
+                if data.get("code") != 0:
+                    print(f"   ❌ Zoho error: {data.get('message')}")
+                    return None
+
+                invoices = data.get("invoices", [])
+                if not invoices:
+                    break
+
+                ids.extend(x["invoice_id"] for x in invoices)
+                print(f"      ✅ page {page}: {len(invoices)} (total {len(ids)})")
+                page += 1
+                time.sleep(0.5)
+
+            except requests.exceptions.Timeout:
+                print(f"   ⏱️  Timeout on page {page}")
                 break
-            
-            all_ids.extend(x["invoice_id"] for x in invoices)
-            if page % 5 == 0 or len(invoices) < 200:
-                print(f"      📦 Page {page}: {len(invoices)} IDs (total: {len(all_ids)})")
-            
-            page += 1
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"   ⚠️  Page {page} error: {e}")
-            break
-    
-    return all_ids
+            except Exception as e:
+                print(f"   ⚠️  page {page} error: {e}")
+                break
+        return list(dict.fromkeys(ids))              # de-dup ids
+
+    if incremental:
+        result = _pull(use_incremental=True)
+        if result is None:
+            print("   ↩️  Incremental failed — falling back to FULL load")
+            return _pull(use_incremental=False) or []
+        return result
+    else:
+        return _pull(use_incremental=False) or []
 
 def get_invoice_detail(invoice_id, token, retries=3):
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
@@ -420,31 +434,54 @@ def get_invoice_detail(invoice_id, token, retries=3):
                 return None
 
 def flatten_invoice_to_rows(inv):
+    """Convert one invoice into multiple rows (1 per line item)."""
     if not inv:
         return []
+
     billing  = inv.get("billing_address", {}) or {}
     shipping = inv.get("shipping_address", {}) or {}
     items = inv.get("line_items", []) or [{}]
+    inv_id = inv.get("invoice_id")
     rows = []
+
     for idx, it in enumerate(items):
+        # stable line id: Zoho line_item_id agar mile to wahi, warna invoice_id + idx
+        lid = it.get("line_item_id") or f"{inv_id}_{idx}"
         rows.append({
-            'invoice_date': inv.get("date"), 'invoice_id': inv.get("invoice_id"),
-            'invoice_number': inv.get("invoice_number"), 'invoice_status': inv.get("status"),
-            'customer_id': inv.get("customer_id"), 'customer_name': inv.get("customer_name"),
-            'customer_city': billing.get("city"), 'customer_state': billing.get("state"),
-            'due_date': inv.get("due_date"), 'balance': inv.get("balance"),
-            'invoice_total': inv.get("total"), 'invoice_subtotal': inv.get("sub_total"),
-            'notes': inv.get("notes"), 'payment_terms_label': inv.get("payment_terms_label"),
-            'reference_number': inv.get("reference_number"), 'place_of_supply': inv.get("place_of_supply"),
-            'shipping_attention': shipping.get("attention"), 'shipping_state': shipping.get("state"),
-            'line_item_id': it.get("line_item_id", f"{inv.get('invoice_id')}_{idx}"),
-            'item_name': it.get("name"), 'item_description': it.get("description"),
-            'quantity': it.get("quantity"), 'unit': it.get("unit"),
-            'item_price': it.get("rate"), 'item_total': it.get("item_total"),
-            'discount_amount': it.get("discount_amount"), 'tax_name': it.get("tax_name"),
-            'tax_percentage': it.get("tax_percentage"), 'tax_amount': it.get("tax_amount"),
-            'sku': it.get("sku"), 'hsn_sac': it.get("hsn_or_sac"), 'product_id': it.get("item_id"),
+            'invoice_date'       : inv.get("date"),
+            'invoice_id'         : inv_id,
+            'invoice_number'     : inv.get("invoice_number"),
+            'invoice_status'     : inv.get("status"),
+            'customer_id'        : inv.get("customer_id"),
+            'customer_name'      : inv.get("customer_name"),
+            'customer_city'      : billing.get("city"),
+            'customer_state'     : billing.get("state"),
+            'due_date'           : inv.get("due_date"),
+            'balance'            : inv.get("balance"),
+            'invoice_total'      : inv.get("total"),
+            'invoice_subtotal'   : inv.get("sub_total"),
+            'notes'              : inv.get("notes"),
+            'payment_terms_label': inv.get("payment_terms_label"),
+            'reference_number'   : inv.get("reference_number"),
+            'place_of_supply'    : inv.get("place_of_supply"),
+            'shipping_attention' : shipping.get("attention"),
+            'shipping_state'     : shipping.get("state"),
+            'line_item_id'       : lid,
+            'item_name'          : it.get("name"),
+            'item_description'   : it.get("description"),
+            'quantity'           : it.get("quantity"),
+            'unit'               : it.get("unit"),
+            'item_price'         : it.get("rate"),
+            'item_total'         : it.get("item_total"),
+            'discount_amount'    : it.get("discount_amount"),
+            'tax_name'           : it.get("tax_name"),
+            'tax_percentage'     : it.get("tax_percentage"),
+            'tax_amount'         : it.get("tax_amount"),
+            'sku'                : it.get("sku"),
+            'hsn_sac'            : it.get("hsn_or_sac"),
+            'product_id'         : it.get("item_id"),
         })
+
     return rows
 
 INVOICE_COLUMNS = ['Invoice Date','Invoice ID','Invoice Number','Issued Date','Invoice Status','Customer ID','Customer Name','Place of Supply','Place of Supply(With State Code)','GST Treatment','Is Inclusive Tax','Is Export Without LUT/Bond','Tax Collected From Customer','Due Date','PurchaseOrder','Currency Code','Exchange Rate','Discount Type','Is Discount Before Tax','Template Name','Entity Discount Percent','TCS Tax Name','TCS Percentage','TDS Calculation Type','TDS Name','TDS Percentage','TDS Section Code','TDS Section','TDS Amount','SubTotal','Total','TotalRetentionAmountFCY','TotalRetentionAmountBCY','Balance','Adjustment','Adjustment Description','Expected Payment Date','Last Payment Date','Payment Terms','Payment Terms Label','Notes','Terms & Conditions','E-WayBill Number','E-WayBill Generated Time','E-WayBill Status','E-WayBill Cancelled Time','E-WayBill Expired Time','Transporter Name','Transporter ID','TCS Amount','Invoice Type','Entity Discount Amount','Shipping Charge','Shipping Charge Tax ID','Shipping Charge Tax Amount','Shipping Charge Tax Name','Shipping Charge Tax %','Shipping Charge Tax Type','Shipping Charge Tax Exemption Code','Shipping Charge SAC Code','Item Name','Item Desc','Quantity','Discount','Discount Amount','Item Total','Usage unit','Item Price','Product ID','Brand','Sales Order Number','Expense Reference ID','Recurrence Name','PayPal','Authorize.Net','Google Checkout','Payflow Pro','Stripe','Paytm','2Checkout','Braintree','Forte','WorldPay','Payments Pro','Square','WePay','Razorpay','ICICI EazyPay','GoCardless','Partial Payments','Billing Attention','Billing Address','Billing Street2','Billing City','Billing State','Billing Country','Billing Code','Billing Phone','Billing Fax','Shipping Attention','Shipping Address','Shipping Street2','Shipping City','Shipping State','Shipping Country','Shipping Code','Shipping Fax','Shipping Phone Number','Supplier Org Name','Supplier GST Registration Number','Supplier Street Address','Supplier City','Supplier State','Supplier Country','Supplier ZipCode','Supplier Phone','Supplier E-Mail','CGST Rate %','SGST Rate %','IGST Rate %','CESS Rate %','CGST(FCY)','SGST(FCY)','IGST(FCY)','CESS(FCY)','CGST','SGST','IGST','CESS','Reverse Charge Tax Name','Reverse Charge Tax Rate','Reverse Charge Tax Type','Item TDS Name','Item TDS Percentage','Item TDS Amount','Item TDS Section Code','Item TDS Section','GST Identification Number (GSTIN)','Nature Of Collection','SKU','Project ID','Project Name','HSN/SAC','Round Off','Sales person','Subject','Primary Contact EmailID','Primary Contact Mobile','Primary Contact Phone','Estimate Number','Item Type','Custom Charges','Shipping Bill#','Shipping Bill Date','Shipping Bill Total','PortCode','Reference Invoice#','Reference Invoice Date','Reference Invoice Type','GST Registration Number(Reference Invoice)','Reason for issuing Debit Note','E-Commerce Operator Name','E-Commerce Operator GSTIN','Account','Account Code','Supply Type','Tax ID','Item Tax','Item Tax %','Item Tax Amount','Item Tax Type','Item Tax Exemption Reason','Kit Combo Item Name']
@@ -475,101 +512,91 @@ def to_invoice_format(raw):
     out['Invoice Type']  = 'Invoice'
     return out[INVOICE_COLUMNS]
 
-# ══════════════════════════════════════════════════════════════════════════
-# MAIN B2B PIPELINE — OPTIMIZED FLOW
-# ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+# RUN: incremental fetch → merge with master → B2B (Invoice format)
+# ════════════════════════════════════════════════════════════════════════
 print("\n" + "="*70)
-print("🚀 B2B ZOHO FETCH - OPTIMIZED INCREMENTAL")
+print("🚀 B2B Zoho fetch (API) — FIXED")
 print("="*70)
 
-print("\n[0] Generating OAuth token...")
-token = get_oauth_token()
-if not token:
-    print("\n❌ FATAL: Could not generate OAuth token!"); sys.exit(1)
+# Load existing master + last sync state
+existing = pd.read_pickle(MASTER_FILE) if os.path.exists(MASTER_FILE) else None
+last_sync = _load_state()
+mode = "incremental" if (existing is not None and last_sync) else "full"
 
-print("\n[1] Loading existing data from disk...")
-master = load_master()
-existing_ids = get_existing_invoice_ids(master)
-sync_state = load_sync_state()
-last_sync = sync_state.get("last_sync_time")
+print(f"\n[1] Sync mode: {mode}")
+if last_sync:
+    print(f"    Last sync: {last_sync}")
 
-# Decide strategy
-if master is not None and last_sync and len(existing_ids) > 100:
-    print(f"\n[2] Fetching ONLY invoices modified since {last_sync[:10]}")
-    print(f"    (Skipping {len(existing_ids):,} already-fetched invoices)")
-    changed_ids = get_invoice_ids_optimized(token, sync_date=last_sync)
+# Fetch invoice IDs
+print(f"\n[2] Fetching invoice IDs...")
+ids = get_invoice_ids(token, sync_date=last_sync) if mode=="incremental" \
+      else get_invoice_ids(token, date_start=FULL_LOAD_START)
+
+print(f"    Total to fetch: {len(ids)}")
+
+if len(ids) == 0:
+    print(f"\n    ℹ️  No new/updated invoices. Using existing master.")
+    raw = existing if existing is not None else pd.DataFrame(columns=RAW_COLUMNS)
 else:
-    print(f"\n[2] Full fetch (first run or state missing)...")
-    changed_ids = get_invoice_ids_optimized(token, sync_date=None)
-
-print(f"   📊 Invoices returned by API: {len(changed_ids):,}")
-
-# Filter: only fetch truly new/updated
-if master is not None and len(existing_ids) > 0:
-    # For incremental mode, we fetch ALL changed IDs (even if they exist,
-    # because they may have been updated)
-    truly_new = [i for i in changed_ids if i not in existing_ids]
-    updated = [i for i in changed_ids if i in existing_ids]
-    print(f"\n[3] Filtering:")
-    print(f"   🆕 Truly new invoices:     {len(truly_new):,}")
-    print(f"   🔄 Updated existing:       {len(updated):,}")
-    print(f"   ✅ Skipping unchanged:     {len(existing_ids) - len(updated):,}")
-    to_fetch = changed_ids  # fetch all changed (new + updated)
-else:
-    truly_new = changed_ids
-    to_fetch = changed_ids
-    print(f"\n[3] First run — fetching all {len(to_fetch):,} invoices")
-
-if len(to_fetch) == 0:
-    print("\n   ℹ️  No changes since last sync!")
-    raw = master if master is not None else pd.DataFrame(columns=RAW_COLUMNS)
-    B2B = to_invoice_format(raw)
-else:
-    print(f"\n[4] Fetching {len(to_fetch):,} invoice details from Zoho...")
+    # Fetch full invoice details
+    print(f"\n[3] Fetching invoice details...")
     new_rows = []
-    for i, inv_id in enumerate(to_fetch, 1):
-        if i % 25 == 0 or i == len(to_fetch):
-            print(f"      ⏳ {i}/{len(to_fetch)} ({i/len(to_fetch)*100:.0f}%)")
+    for i, inv_id in enumerate(ids, 1):
+        if i % 50 == 0 or i == len(ids):
+            print(f"    {i}/{len(ids)}")
+
         inv = get_invoice_detail(inv_id, token)
         if inv:
             new_rows.extend(flatten_invoice_to_rows(inv))
-    
-    new_raw = pd.DataFrame(new_rows, columns=RAW_COLUMNS) if new_rows else pd.DataFrame(columns=RAW_COLUMNS)
-    print(f"   ✅ Fetched: {len(new_raw):,} line items from {len(to_fetch):,} invoices")
 
-    print("\n[5] Merging with existing master...")
-    if master is not None and len(master) > 0:
-        # Remove updated invoices from old master (they're being replaced)
-        if len(new_raw) > 0:
-            updated_ids = set(new_raw['invoice_id'].unique())
-            master_kept = master[~master['invoice_id'].isin(updated_ids)]
-            raw = pd.concat([master_kept, new_raw], ignore_index=True)
-            print(f"   Merged: {len(master_kept):,} kept + {len(new_raw):,} new/updated = {len(raw):,} total")
-        else:
-            raw = master
+    new_raw = pd.DataFrame(new_rows, columns=RAW_COLUMNS) if new_rows else pd.DataFrame(columns=RAW_COLUMNS)
+    print(f"    ✅ Flattened: {len(new_raw)} line items "
+          f"({new_raw['invoice_id'].nunique() if len(new_raw) else 0} invoices)")
+
+    # ── INVOICE-LEVEL REPLACE (not line-level dedup) ─────────────────────
+    # Jo invoices abhi fetch huyi (nayi YA edited), unki PURANI saari lines
+    # master se hata do — phir fresh lines daalo. Isse edited invoice ki
+    # stale/duplicate lines kabhi nahi bachengi (yehi qty mismatch ka root cause tha).
+    if existing is not None and len(new_raw):
+        refetched_ids = set(new_raw['invoice_id'].unique())
+        before = len(existing)
+        existing_clean = existing[~existing['invoice_id'].isin(refetched_ids)].copy()
+        print(f"    🔄 Invoice-level replace: {len(refetched_ids)} invoices refreshed "
+              f"({before - len(existing_clean)} stale lines removed)")
+        raw = pd.concat([existing_clean, new_raw], ignore_index=True)
+    elif existing is not None:
+        raw = existing.copy()
     else:
         raw = new_raw
-    
+
+    # Date coercion
     raw['invoice_date'] = pd.to_datetime(raw['invoice_date'], errors='coerce')
-    raw['due_date']     = pd.to_datetime(raw['due_date'], errors='coerce')
+    raw['due_date']     = pd.to_datetime(raw['due_date'],     errors='coerce')
+
+    # Safety dedup (belt + suspenders) — exact (invoice_id, line_item_id) dupes hatao
     raw = (raw.sort_values('invoice_date', ascending=False)
               .drop_duplicates(subset=['invoice_id','line_item_id'], keep='first')
               .reset_index(drop=True))
+
+    # Numeric coercion
     for c in ['quantity','item_price','item_total','discount_amount','tax_percentage',
               'tax_amount','balance','invoice_total','invoice_subtotal']:
         raw[c] = pd.to_numeric(raw[c], errors='coerce')
 
+    # Persist master
     raw.to_pickle(MASTER_FILE)
-    print(f"   ✅ Master saved: {len(raw):,} line items ({raw['invoice_id'].nunique():,} invoices)")
-    save_sync_state(datetime.now().isoformat(), raw['invoice_id'].nunique())
+    _save_state()
+    print(f"\n[3] Master saved: {len(raw):,} line items ({raw['invoice_id'].nunique():,} invoices)")
 
     # PERSIST TO DRIVE (critical for next run!)
     if DRIVE_FOLDER_ID:
-        print("\n[6] Uploading updated state to Drive...")
+        print("\n[4] Uploading updated state to Drive...")
         drive_upload_to_folder(MASTER_FILE, "B2B_master.pkl", DRIVE_FOLDER_ID)
         drive_upload_to_folder(SYNC_STATE_FILE, "B2B_sync_state.json", DRIVE_FOLDER_ID)
 
-    B2B = to_invoice_format(raw)
+# Convert to 173-column format
+B2B = to_invoice_format(raw)
 
 print(f"\n[7] ✅ B2B READY: {B2B.shape[0]:,} rows × {B2B.shape[1]} columns")
 print(f"    💰 Revenue: ₹{pd.to_numeric(B2B['Item Total'], errors='coerce').sum():,.0f}")
