@@ -668,6 +668,7 @@ WITH order_totals AS (
     INNER JOIN public.orders o ON o.order_id = oi.order_id AND o.status = true
         AND (o.payment_status = 1 OR o.payment_mode IN ('COD','POD') OR o.is_draft_order = true)
     WHERE oi.status = true
+      AND o.platform IS DISTINCT FROM 'shopify'
       AND (o.order_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
           BETWEEN '{start_date}'::date AND '{end_date}'::date
     GROUP BY oi.order_id
