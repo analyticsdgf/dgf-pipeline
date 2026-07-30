@@ -256,7 +256,7 @@ RAW_COLUMNS = [
     'customer_id','customer_name','customer_city','customer_state',
     'due_date','balance','invoice_total','invoice_subtotal','notes',
     'payment_terms_label','reference_number','place_of_supply',
-    'shipping_attention','shipping_state',
+    'shipping_attention','billing_attention','shipping_state',
     'line_item_id','item_name','item_description','quantity','unit',
     'item_price','item_total','discount_amount','tax_name',
     'tax_percentage','tax_amount','sku','hsn_sac','product_id',
@@ -465,6 +465,7 @@ def flatten_invoice_to_rows(inv):
             'reference_number'   : inv.get("reference_number"),
             'place_of_supply'    : inv.get("place_of_supply"),
             'shipping_attention' : shipping.get("attention"),
+            'billing_attention'  : billing.get("attention"),
             'shipping_state'     : shipping.get("state"),
             'line_item_id'       : lid,
             'item_name'          : it.get("name"),
@@ -497,7 +498,7 @@ def to_invoice_format(raw):
         'item_price':'Item Price','item_total':'Item Total','discount_amount':'Discount Amount',
         'tax_name':'Item Tax','tax_percentage':'Item Tax %','tax_amount':'Item Tax Amount',
         'sku':'SKU','hsn_sac':'HSN/SAC','product_id':'Product ID','place_of_supply':'Place of Supply',
-        'shipping_attention':'Shipping Attention','shipping_state':'Shipping State',
+        'shipping_attention':'Shipping Attention','billing_attention':'Billing Attention','shipping_state':'Shipping State',
         'customer_city':'Shipping City',
     }
     for s, d in direct.items():
@@ -1288,6 +1289,18 @@ B2B['Shipping Province Name'] = (
 )
 B2B['Fulfillment Status'] = B2B['Fulfillment Status'].astype(str).str.strip().str.title()
 B2B['Created at'] = pd.to_datetime(B2B['Created at'], errors='coerce')
+
+# v12.1: dark-store signal (Billing Attention) ko ALAG column mat rakho —
+#        warna master_orders ka schema disturb hota hai. Zoho ke case mein
+#        'Customer ID' waise bhi khaali rehta hai (v11 mein drop ho jaata tha),
+#        isliye attention text ko wahin 'Customer ID' mein daal do.
+#        Cell 35 dark-store detect isi 'Customer ID' se karega.
+if 'Billing Attention' not in B2B.columns:
+    B2B['Billing Attention'] = ''
+_attn = B2B['Billing Attention'].astype(str).str.strip()
+_attn = _attn.replace({'nan': '', 'None': '', 'NaN': ''})
+B2B['Customer ID'] = _attn          # stash dark-store signal here (empty otherwise)
+B2B = B2B.drop(columns=['Billing Attention'])   # no separate column in master
  
 # Numeric coercion
 for col in ['Lineitem quantity', 'Lineitem price', 'Lineitem unit price']:
@@ -1305,7 +1318,7 @@ B2B.loc[is_first_line, 'Total']    = invoice_totals[is_first_line]
  
 B2B = B2B[[
     'channel', 'sub_channel', 'Name', 'unique_key',
-    'Created at', 'Billing Name',
+    'Created at', 'Billing Name', 'Customer ID',
     'Lineitem name', 'Lineitem sku', 'Lineitem quantity',
     'Lineitem price', 'Lineitem unit price',
     'Subtotal', 'Total',
@@ -1349,49 +1362,82 @@ for col in ['Phone', 'Billing Phone', 'Shipping Phone', 'Email']:
 
 
 
-# ---- notebook cell 18 --------------------------------------------------
 # ──────────────────────────────────────────────────────────────────
-# v7 NEW: Bifurcate B2B (Zoho) by customer name
-#   - "CPC" in name      → B2C / Blinkit
-#   - "Zomato" in name   → B2B / B2B_Hyperpure
-#   - Everything else    → B2B / B2B_Institutional
-# B2B_DraftOrder already excluded in earlier cell
+# v12: Bifurcate B2B (Zoho) into B2B / B2C sub-channels
+#   Priority (first match wins):
+#     1. "CPC"        in name/attention                   -> B2C / Blinkit
+#     2. "Dark Store" in name/attention  (>= 25 Jul 2026) -> B2C / Blinkit Dark Store   [NEW]
+#     3. "Zomato"     in name  (non-cpc, non-dark)        -> B2B / B2B_Hyperpure
+#     4. everything else                                  -> B2B / B2B_Institutional
+#
+#   WHY: team ne dark-store ka naam Customer Name mein nahi, invoice ke
+#     "Billing Attention" mein daala. Wo signal ab 'Customer ID' column mein
+#     stash hai (cell 31). Billing Name + us signal ko jodkar dekhte hain
+#     (future-proof: jab customer name theek hoga tab bhi ye chalega).
+#   WHY date guard: dark-store labelling 25 Jul 2026 se shuru hui — usse pehle
+#     ke invoices ko re-classify nahi karna, warna purani B2B history badal jayegi.
 # ──────────────────────────────────────────────────────────────────
-print("🔀 Bifurcating B2B channel by customer name...\n")
+print("\U0001F500 Bifurcating B2B (Zoho) into B2B / B2C sub-channels...\n")
+
+DARK_STORE_FROM = pd.Timestamp('2026-07-25')   # dark-store rule applies from this date
 
 mask_b2b_zoho = (master_orders['channel'] == 'B2B') & (master_orders['sub_channel'] == 'Zoho_Invoice')
 print(f"   Total B2B (Zoho) rows: {mask_b2b_zoho.sum():,}")
 
-# Build bifurcation masks (case-insensitive contains)
-mask_cpc = mask_b2b_zoho & master_orders['Billing Name'].astype(str).str.contains('CPC', case=False, na=False)
-mask_zomato = mask_b2b_zoho & master_orders['Billing Name'].astype(str).str.contains('Zomato', case=False, na=False) & ~mask_cpc
-mask_institutional = mask_b2b_zoho & ~mask_cpc & ~mask_zomato
+# Combined text = Customer Name (Billing Name) + dark-store signal.
+# v12.1: dark-store signal ab 'Customer ID' mein hai (cell 31 ne wahin stash kiya),
+#        alag 'Billing Attention' column nahi rakha (schema clean rehta hai).
+#        Only B2B/Zoho rows ke Customer ID ko attention treat karo — 1P/Shopify ka
+#        Customer ID asli customer id hai, use signal mein mat milao.
+if 'Customer ID' in master_orders.columns:
+    attn = master_orders['Customer ID'].where(mask_b2b_zoho, '').astype(str)
+    attn = attn.replace({'nan': '', 'None': '', 'NaN': ''})
+else:
+    attn = pd.Series('', index=master_orders.index)
+name_txt = master_orders['Billing Name'].astype(str) + ' ' + attn
 
-# Apply channel + sub_channel reassignments
-master_orders.loc[mask_cpc, 'channel'] = 'B2C'
-master_orders.loc[mask_cpc, 'sub_channel'] = 'Blinkit'
+has_cpc  = name_txt.str.contains('cpc', case=False, na=False)
+has_dark = name_txt.str.contains(r'dark\s*store', case=False, na=False, regex=True)
+has_zom  = name_txt.str.contains('zomato', case=False, na=False)
+on_or_after = master_orders['Created at'] >= DARK_STORE_FROM
 
-master_orders.loc[mask_zomato, 'sub_channel'] = 'B2B_Hyperpure'   # channel stays 'B2B'
-master_orders.loc[mask_institutional, 'sub_channel'] = 'B2B_Institutional'  # channel stays 'B2B'
+# Mutually exclusive masks (first match wins)
+mask_cpc  = mask_b2b_zoho & has_cpc
+mask_dark = mask_b2b_zoho & ~mask_cpc & has_dark & on_or_after
+mask_zom  = mask_b2b_zoho & ~mask_cpc & ~mask_dark & has_zom
+mask_inst = mask_b2b_zoho & ~mask_cpc & ~mask_dark & ~mask_zom
+
+# Apply channel + sub_channel
+master_orders.loc[mask_cpc,  'channel']     = 'B2C'
+master_orders.loc[mask_cpc,  'sub_channel'] = 'Blinkit'
+
+master_orders.loc[mask_dark, 'channel']     = 'B2C'
+master_orders.loc[mask_dark, 'sub_channel'] = 'Blinkit Dark Store'
+
+master_orders.loc[mask_zom,  'sub_channel'] = 'B2B_Hyperpure'      # channel stays 'B2B'
+master_orders.loc[mask_inst, 'sub_channel'] = 'B2B_Institutional'  # channel stays 'B2B'
 
 # Report
-print(f"\n   ✅ Bifurcation complete:")
-print(f"      B2C / Blinkit:             {mask_cpc.sum():>6,} rows  (CPC in name)")
-print(f"      B2B / B2B_Hyperpure:       {mask_zomato.sum():>6,} rows  (Zomato in name, non-CPC)")
-print(f"      B2B / B2B_Institutional:   {mask_institutional.sum():>6,} rows  (all others)")
+print("\n   \u2705 Bifurcation complete:")
+print(f"      B2C / Blinkit:              {mask_cpc.sum():>6,} rows  (CPC)")
+print(f"      B2C / Blinkit Dark Store:   {mask_dark.sum():>6,} rows  (Dark Store, >= 25 Jul)")
+print(f"      B2B / B2B_Hyperpure:        {mask_zom.sum():>6,} rows  (Zomato, non-CPC/dark)")
+print(f"      B2B / B2B_Institutional:    {mask_inst.sum():>6,} rows  (all others)")
 
-print(f"\n📊 Final channel distribution:")
+print("\n\U0001F4CA Final channel distribution:")
 print(master_orders['channel'].value_counts().to_string())
-
-print(f"\n📋 Final sub_channel distribution:")
+print("\n\U0001F4CB Final sub_channel distribution:")
 print(master_orders['sub_channel'].value_counts().to_string())
 
-# Sanity check — sample customer names per new bucket
-print(f"\n🔍 Sample customers per new bucket:")
-for ch_name, m in [('B2C/Blinkit', mask_cpc), ('B2B/Hyperpure', mask_zomato), ('B2B/Institutional', mask_institutional)]:
-    sample = master_orders.loc[m, 'Billing Name'].drop_duplicates().head(3).tolist()
-    print(f"   {ch_name}: {sample}")
-
+# Sanity — sample per bucket
+print("\n\U0001F50D Sample per new bucket:")
+for nm, m in [('B2C/Blinkit', mask_cpc), ('B2C/Blinkit Dark Store', mask_dark),
+              ('B2B/Hyperpure', mask_zom), ('B2B/Institutional', mask_inst)]:
+    if 'Customer ID' in master_orders.columns:
+        samp = master_orders.loc[m, ['Billing Name','Customer ID']].drop_duplicates().head(3).values.tolist()
+    else:
+        samp = master_orders.loc[m, 'Billing Name'].drop_duplicates().head(3).tolist()
+    print(f"   {nm}: {samp}")
 
 
 # ---- notebook cell 19 --------------------------------------------------
@@ -1695,7 +1741,7 @@ mask_1p = mask_1p_shopify | mask_1p_admin
 # All three use the same Zoho line-item structure
 mask_b2b_zoho = (
     ((master_orders['channel'] == 'B2B') & master_orders['sub_channel'].isin(['B2B_Hyperpure', 'B2B_Institutional']))
-    | ((master_orders['channel'] == 'B2C') & (master_orders['sub_channel'] == 'Blinkit'))
+    | (master_orders['channel'] == 'B2C')   # v12: ALL B2C (Blinkit + Blinkit Dark Store + any future sub) are Zoho line-level
 )
 
 print(f"📋 Processing:")
