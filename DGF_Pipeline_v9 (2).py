@@ -2221,7 +2221,7 @@ print("🔄 Adding segmentation columns...")
 # Voided/Cancelled/Refunded shouldn't count toward customer's lifetime journey
 valid_orders = master_orders[
     master_orders['customer_key'].notna() &
-    (master_orders['order_status'] == 'Completed')   # ← NEW filter
+    (master_orders['order_status'].isin(['Completed', 'Pending']))   # ← NEW filter
 ].copy()
 
 order_level = (
