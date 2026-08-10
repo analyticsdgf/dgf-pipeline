@@ -1363,32 +1363,35 @@ for col in ['Phone', 'Billing Phone', 'Shipping Phone', 'Email']:
 
 
 # ──────────────────────────────────────────────────────────────────
-# v12: Bifurcate B2B (Zoho) into B2B / B2C sub-channels
+# v13: Bifurcate B2B (Zoho) into B2B / B2C sub-channels
 #   Priority (first match wins):
-#     1. "CPC"        in name/attention                   -> B2C / Blinkit
-#     2. "Dark Store" in name/attention  (>= 25 Jul 2026) -> B2C / Blinkit Dark Store   [NEW]
-#     3. "Zomato"     in name  (non-cpc, non-dark)        -> B2B / B2B_Hyperpure
-#     4. everything else                                  -> B2B / B2B_Institutional
+#     1. "CPC"              in name/attention  -> B2C / Blinkit
+#     2. "Dark Store"/"BDS" in name/attention  -> B2C / Blinkit Dark Store   [v13: +BDS, date-agnostic]
+#     3. "Zomato"           in name (non-cpc, non-dark) -> B2B / B2B_Hyperpure
+#     4. everything else                                -> B2B / B2B_Institutional
 #
-#   WHY: team ne dark-store ka naam Customer Name mein nahi, invoice ke
-#     "Billing Attention" mein daala. Wo signal ab 'Customer ID' column mein
-#     stash hai (cell 31). Billing Name + us signal ko jodkar dekhte hain
-#     (future-proof: jab customer name theek hoga tab bhi ye chalega).
-#   WHY date guard: dark-store labelling 25 Jul 2026 se shuru hui — usse pehle
-#     ke invoices ko re-classify nahi karna, warna purani B2B history badal jayegi.
+#   WHY: team dark-store ka naam Customer Name mein nahi, invoice ke
+#     "Billing Attention" mein daalti hai. Wo signal 'Customer ID' column
+#     mein stash hai (B2B clean step). Billing Name + us signal ko jodkar
+#     dekhte hain — chahe customer name ho ya sirf billing attention, dono cover.
+#
+#   v13 changes vs v12:
+#     - "BDS" (dark-store ka short naam) ko bhi dark-store maana jayega.
+#       25 Jul ko attention "dark store" tha; 8 Aug ko "BDS" — dono ab match.
+#     - DATE GUARD hataya: pehle rule sirf (Created at >= 25 Jul) par chalta tha.
+#       Ab KISI BHI date ke invoice par name/attention mein dark-store/BDS ho to
+#       Blinkit Dark Store banega. Safe hai: labelling 25 Jul se hi shuru hui,
+#       purane B2B invoices mein ye signal hai hi nahi.
 # ──────────────────────────────────────────────────────────────────
 print("\U0001F500 Bifurcating B2B (Zoho) into B2B / B2C sub-channels...\n")
-
-DARK_STORE_FROM = pd.Timestamp('2026-07-25')   # dark-store rule applies from this date
 
 mask_b2b_zoho = (master_orders['channel'] == 'B2B') & (master_orders['sub_channel'] == 'Zoho_Invoice')
 print(f"   Total B2B (Zoho) rows: {mask_b2b_zoho.sum():,}")
 
 # Combined text = Customer Name (Billing Name) + dark-store signal.
-# v12.1: dark-store signal ab 'Customer ID' mein hai (cell 31 ne wahin stash kiya),
-#        alag 'Billing Attention' column nahi rakha (schema clean rehta hai).
-#        Only B2B/Zoho rows ke Customer ID ko attention treat karo — 1P/Shopify ka
-#        Customer ID asli customer id hai, use signal mein mat milao.
+# dark-store signal 'Customer ID' mein hai (B2B clean step ne wahin stash kiya).
+# Only B2B/Zoho rows ke Customer ID ko attention treat karo — 1P/Shopify ka
+# Customer ID asli customer id hai, use signal mein mat milao.
 if 'Customer ID' in master_orders.columns:
     attn = master_orders['Customer ID'].where(mask_b2b_zoho, '').astype(str)
     attn = attn.replace({'nan': '', 'None': '', 'NaN': ''})
@@ -1397,13 +1400,14 @@ else:
 name_txt = master_orders['Billing Name'].astype(str) + ' ' + attn
 
 has_cpc  = name_txt.str.contains('cpc', case=False, na=False)
-has_dark = name_txt.str.contains(r'dark\s*store', case=False, na=False, regex=True)
+# v13: dark-store = full "dark store" OR short code "BDS".
+#      \bbds\b = word-boundary, taaki kisi shabd ke andar galat match na ho.
+has_dark = name_txt.str.contains(r'dark\s*store|\bbds\b', case=False, na=False, regex=True)
 has_zom  = name_txt.str.contains('zomato', case=False, na=False)
-on_or_after = master_orders['Created at'] >= DARK_STORE_FROM
 
-# Mutually exclusive masks (first match wins)
+# Mutually exclusive masks (first match wins) — v13: NO date guard.
 mask_cpc  = mask_b2b_zoho & has_cpc
-mask_dark = mask_b2b_zoho & ~mask_cpc & has_dark & on_or_after
+mask_dark = mask_b2b_zoho & ~mask_cpc & has_dark
 mask_zom  = mask_b2b_zoho & ~mask_cpc & ~mask_dark & has_zom
 mask_inst = mask_b2b_zoho & ~mask_cpc & ~mask_dark & ~mask_zom
 
@@ -1420,7 +1424,7 @@ master_orders.loc[mask_inst, 'sub_channel'] = 'B2B_Institutional'  # channel sta
 # Report
 print("\n   \u2705 Bifurcation complete:")
 print(f"      B2C / Blinkit:              {mask_cpc.sum():>6,} rows  (CPC)")
-print(f"      B2C / Blinkit Dark Store:   {mask_dark.sum():>6,} rows  (Dark Store, >= 25 Jul)")
+print(f"      B2C / Blinkit Dark Store:   {mask_dark.sum():>6,} rows  (Dark Store / BDS, any date)")
 print(f"      B2B / B2B_Hyperpure:        {mask_zom.sum():>6,} rows  (Zomato, non-CPC/dark)")
 print(f"      B2B / B2B_Institutional:    {mask_inst.sum():>6,} rows  (all others)")
 
@@ -2359,6 +2363,21 @@ discarded_mask = (
 )
 master_orders.loc[discarded_mask, 'order_status'] = 'Discarded'
 print(f"✅ Marked {discarded_mask.sum()} discarded orders")
+
+# Influencer Orders  ── v13 NEW
+# Admin ke 'notes' se aaya text ab 'Tags_customer' mein hai (admin clean step ne
+# notes -> Tags_customer2 -> Tags_customer merge kiya). Jaise test/duplicate detect
+# karte hain, waise hi 'influencer' shabd dhoondh kar order_status = 'Influencer Order'.
+# GUARD: pehle assign ho chuke hard-exclusion tags (Test/Transfer/Duplicate/
+# Discarded) ko override NAHI karna — unki priority upar rahegi.
+_exclusion_tags = ['Test Orders', 'Internal Transfer', 'Duplicate Orders', 'Discarded']
+influencer_mask = (
+    master_orders['Full Name'].astype(str).str.contains('influencer', case=False, na=False) |
+    master_orders['Tags_customer'].astype(str).str.contains('influencer', case=False, na=False) |
+    master_orders['Lineitem name'].astype(str).str.contains('influencer', case=False, na=False)
+) & (~master_orders['order_status'].isin(_exclusion_tags))
+master_orders.loc[influencer_mask, 'order_status'] = 'Influencer Order'
+print(f"✅ Marked {influencer_mask.sum()} influencer orders")
 
 print(master_orders['order_status'].value_counts().to_string())
 
